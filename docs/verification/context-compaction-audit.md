@@ -4,7 +4,7 @@ Date: 2026-09-18. Baseline: `3bc6eca`. Implementation branch: `codex/context-aud
 
 ## Root issue and remaining uncertainty
 
-The router hardening patch is already activated. Its heartbeats, stream failure diagnostics, catalog provenance and native image routing do not explain or repair all automatic compaction behavior. The earlier connection resets are a separate incident; their initiating peer remains unknown.
+The router hardening patch is already activated. Its heartbeats, stream failure diagnostics, catalog provenance and native image routing do not control automatic compaction. Codex owns compaction and Harbor routes the resulting request. The earlier connection resets are a separate incident; the old records did not identify their initiating peer. New failure records distinguish upstream and downstream observations without retaining content.
 
 A local read-only audit of the affected rollout reproduces eight consecutive short cycles beginning at lines 15822 through 15974. Each has one normal provider request, with input between 140,277 and 140,870 tokens against an observed effective context window of 121,600. Compaction repeats after 19–41 seconds. The next cycle begins under the same small window but continues through the later correction, so it is not another one-request loop.
 

@@ -4,7 +4,7 @@ Status: implemented and tested in the isolated candidate on September 17, 2026. 
 
 ## Request behavior
 
-Each accepted Azure inference request has one 180-second monotonic deadline. It begins after input parsing and route preparation, before admission. Queueing, DNS resolution, TCP connect, TLS handshake, request upload, response headers, body/SSE reads, any same-response resume GETs, and downstream delivery consume that same budget. A trickle of bytes does not reset it. Verification probes use the same transport with a ten-second budget.
+Each accepted Azure inference request has one 180-second monotonic deadline. It begins after input parsing and route preparation, before admission. Queueing, DNS resolution, TCP connect, TLS handshake, request upload, response headers, body or SSE reads, any same-response resume GETs, and downstream delivery consume that same budget. A trickle of bytes does not reset it. Verification probes use the same transport with a ten-second budget.
 
 Admission remains process-local: two active requests per endpoint/deployment, sixteen FIFO waiters, and at most thirty seconds waiting. The total deadline can expire earlier. A permit stays held until the upstream response closes. Verification shares this queue. Queue rejection or cancellation before dispatch sends no provider request and preserves prior readiness proof.
 
@@ -22,7 +22,9 @@ The gateway closes the response before releasing admission. A known completed re
 
 ## Retry policy
 
-Azure performs one inference POST per accepted gateway request. It does not automatically replay 429, 503, a transport failure, or partial output. Same-response recovery GETs are not inference retries. A complete provider error preserves its status, body, and supported headers such as `Retry-After`. Forwarding that header is not an automatic backoff scheduler.
+Azure normally performs one inference POST per accepted gateway request. Harbor permits one additional POST only when the transport proves that model bytes were not possible on the first attempt. A connection failure after model bytes are possible never replays the POST. Harbor records that delivery as uncertain. It does not automatically replay 429, 503, a transport failure after dispatch, or partial output. Same-response recovery GETs are not inference retries. A complete provider error preserves its status, body, and supported headers such as `Retry-After`. Forwarding that header is not an automatic backoff scheduler.
+
+Automatic context compaction belongs to Codex. Harbor receives the resulting request and routes it like any other request. Compaction near a context limit does not, by itself, prove that compaction caused an upstream disconnect. The authenticated status record names the observed side of a connection failure when the socket evidence permits it. It does not retain request content or exception text.
 
 Generated `[model_providers.model-harbor]` configuration now explicitly sets both `request_max_retries = 0` and `stream_max_retries = 0`. Managed team workers already used those values. The shared stanza applies to all models routed through Harbor when Codex loads it. Baseten's internal gateway retry/pacing policy is unchanged.
 

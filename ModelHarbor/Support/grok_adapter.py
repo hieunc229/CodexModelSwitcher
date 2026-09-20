@@ -72,6 +72,9 @@ _stream_spec.loader.exec_module(_stream_module)
 _transport_spec = importlib.util.spec_from_file_location('harbor_azure_transport', pathlib.Path(__file__).with_name('azure_transport.py'))
 _transport_module = importlib.util.module_from_spec(_transport_spec)
 _transport_spec.loader.exec_module(_transport_module)
+_transport_common_spec = importlib.util.spec_from_file_location('harbor_transport', pathlib.Path(__file__).with_name('transport.py'))
+TRANSPORT = importlib.util.module_from_spec(_transport_common_spec)
+_transport_common_spec.loader.exec_module(TRANSPORT)
 _metrics_spec = importlib.util.spec_from_file_location('harbor_request_metrics', pathlib.Path(__file__).with_name('request_metrics.py'))
 _metrics_module = importlib.util.module_from_spec(_metrics_spec)
 _metrics_spec.loader.exec_module(_metrics_module)
@@ -95,6 +98,114 @@ CODEX_APP_TOOLS_ENABLED = os.environ.get('MODEL_HARBOR_CODEX_APP_TOOLS') == '1'
 
 
 _CATALOG_VERSION = None
+
+
+class _ClientDisconnected(ConnectionError):
+    """A downstream write failed; the provider-side outcome stays separate."""
+
+
+class FailureContext:
+    """Content-free observations from the two sides of one request."""
+
+    def __init__(self):
+        self.upstream = None
+        self.downstream = None
+        self.terminal_delivered = False
+        self.request_kind = 'normal_or_unknown'
+        self.compaction_phase = None
+
+    def set_request_shape(self, source, incoming_headers=None):
+        metadata = source.get('client_metadata', {}) if isinstance(source, dict) else {}
+        if not isinstance(metadata, dict):
+            return
+        nested = metadata.get('x-codex-turn-metadata')
+        if nested is None and incoming_headers is not None:
+            nested = incoming_headers.get('x-codex-turn-metadata')
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except (TypeError, ValueError):
+                nested = None
+        if isinstance(nested, dict):
+            metadata = dict(metadata, **nested)
+        if metadata.get('request_kind') == 'compaction':
+            self.request_kind = 'compaction'
+            compaction = metadata.get('compaction', {})
+            if isinstance(compaction, str):
+                try:
+                    compaction = json.loads(compaction)
+                except (TypeError, ValueError):
+                    compaction = {}
+            if isinstance(compaction, dict) and compaction.get('phase') in ('pre_turn', 'mid_turn'):
+                self.compaction_phase = compaction['phase']
+
+    def observe_upstream(self, kind, operation):
+        if self.upstream is None:
+            self.upstream = {'kind': kind, 'operation': operation}
+
+    def observe_downstream(self, kind='client_disconnect', operation='response_write'):
+        if self.downstream is None:
+            self.downstream = {'kind': kind, 'operation': operation}
+
+    def mark_terminal_delivered(self):
+        self.terminal_delivered = True
+
+    @property
+    def classification(self):
+        if self.upstream and self.downstream:
+            return 'mixed_failure'
+        if self.upstream:
+            if self.upstream['kind'] == 'eof':
+                return 'provider_stream_incomplete'
+            if self.upstream['kind'].startswith('http_'):
+                return 'provider_http_error'
+            if self.upstream['kind'] == 'timeout':
+                return 'upstream_timeout'
+            return 'provider_connection_lost'
+        if self.downstream:
+            return 'client_disconnected'
+        return None
+
+    def record(self, *, provider, model, budget, elapsed, attempts, resume_attempts,
+               phase=None, kind=None):
+        classification = self.classification
+        if classification is None:
+            return None
+        side = ('both' if self.upstream and self.downstream else
+                'upstream' if self.upstream else 'downstream')
+        record = {
+            'schema': 1,
+            'provider': provider,
+            'model': model,
+            'side': side,
+            'source': 'mixed' if side == 'both' else side,
+            'classification': classification,
+            'kind': kind or classification,
+            'phase': phase,
+            'request_kind': self.request_kind,
+            'compaction_phase': self.compaction_phase,
+            'dispatch_state': budget.dispatch_state.name.lower() if budget else 'not_started',
+            'initial_post_attempts': attempts,
+            'resume_attempts': resume_attempts,
+            'outcome': 'known' if self.terminal_delivered else 'uncertain',
+            'elapsed_seconds': round(elapsed, 3),
+            'at': time.time(),
+        }
+        if self.upstream:
+            record['upstream_kind'] = self.upstream['kind']
+            record['upstream_operation'] = self.upstream['operation']
+        if self.downstream:
+            record['downstream_kind'] = self.downstream['kind']
+            record['downstream_operation'] = self.downstream['operation']
+        return record
+
+
+def _transport_operation(initial_attempts, resume_attempts, started):
+    if resume_attempts:
+        return 'resume_get'
+    if started:
+        return 'stream_read'
+    return 'post'
 
 
 def detect_codex_version():
@@ -1561,6 +1672,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def send_response(self, code, message=None):
+        try:
+            return super().send_response(code, message)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout) as error:
+            raise _ClientDisconnected() from error
+
+    def send_header(self, keyword, value):
+        try:
+            return super().send_header(keyword, value)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout) as error:
+            raise _ClientDisconnected() from error
+
     def error(self, code, message, headers=None, provider_body=None, budget=None):
         body = json.dumps({'error': message}).encode() if provider_body is None else provider_body
         self.send_response(code)
@@ -1573,7 +1696,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.finish_headers(budget)
         self.write_output(body, budget)
 
-    def begin_event_stream(self, route):
+    def begin_event_stream(self, route, budget=None):
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-cache')
@@ -1581,7 +1704,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if route:
             self.send_header('X-Model-Harbor-Provider', route['provider'])
             self.send_header('X-Model-Harbor-Model', route['model'])
-        self.end_headers()
+        self.finish_headers(budget)
         self.close_connection = True
 
     def stream_failure(self, status, message, budget=None):
@@ -1591,31 +1714,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  'error': {'code': code, 'message': message}}}
         try:
             self.write_output(('event: response.failed\ndata: ' + json.dumps(event) + '\n\n').encode(), budget)
-        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+        except _ClientDisconnected:
+            context = getattr(self, '_failure_context', None)
+            if context is not None:
+                context.observe_downstream()
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
+            context = getattr(self, '_failure_context', None)
+            if context is not None:
+                context.observe_downstream()
             self.close_connection = True
 
     def finish_headers(self, budget=None):
-        if budget is None:
-            return self.end_headers()
-        self.connection.settimeout(budget.remaining())
-        budget.io(self.end_headers)
+        try:
+            if budget is None:
+                return self.end_headers()
+            self.connection.settimeout(budget.remaining())
+            budget.io(self.end_headers)
+        except (_transport_module.RequestDeadline, _transport_module.RequestCancelled):
+            raise
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout) as error:
+            raise _ClientDisconnected() from error
 
     def write_output(self, value, budget=None, *, terminal=False):
-        if budget is None:
-            self.wfile.write(value)
-            self.wfile.flush()
-            return
-        self.connection.settimeout(budget.remaining())
-        if terminal:
-            # A client may close immediately after receiving the terminal frame.
-            # Successful write/flush is the delivery boundary, not a later read.
-            self.wfile.write(value)
-            self.wfile.flush()
-            budget.finish()
-            return
-        budget.io(self.wfile.write, value)
-        self.connection.settimeout(budget.remaining())
-        budget.io(self.wfile.flush)
+        try:
+            if budget is None:
+                self.wfile.write(value)
+                self.wfile.flush()
+                if terminal:
+                    context = getattr(self, '_failure_context', None)
+                    if context is not None:
+                        context.mark_terminal_delivered()
+                return
+            self.connection.settimeout(budget.remaining())
+            if terminal:
+                # A client may close immediately after receiving the terminal frame.
+                # Successful write/flush is the delivery boundary, not a later read.
+                self.wfile.write(value)
+                self.wfile.flush()
+                context = getattr(self, '_failure_context', None)
+                if context is not None:
+                    context.mark_terminal_delivered()
+                budget.finish()
+                return
+            budget.io(self.wfile.write, value)
+            self.connection.settimeout(budget.remaining())
+            budget.io(self.wfile.flush)
+        except (_transport_module.RequestDeadline, _transport_module.RequestCancelled):
+            raise
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout) as error:
+            raise _ClientDisconnected() from error
 
     @staticmethod
     def response_lines(upstream, budget=None):
@@ -1969,6 +2117,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global LAST_ROUTE, OPENROUTER_KEY, AZURE_CONNECTION
+        failure_context = FailureContext()
+        self._failure_context = failure_context
         started = False
         streaming_response = False
         headers_complete = False
@@ -2006,6 +2156,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return False
             except (_transport_module.RequestCancelled, _transport_module.RequestDeadline) as error:
                 cancelled = isinstance(error, _transport_module.RequestCancelled)
+                if cancelled and failure_context.upstream is None:
+                    failure_context.observe_downstream()
+                elif not cancelled:
+                    failure_context.observe_upstream('timeout', 'budget')
                 activity_status = 'cancelled' if cancelled else 'failed'
                 activity_http_status = None if cancelled else 504
                 with ROUTE_LOCK:
@@ -2040,6 +2194,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.error(code, message, headers=response_headers, budget=azure_budget)
             except (_transport_module.RequestDeadline, _transport_module.RequestCancelled):
                 azure_stopped()
+            except _ClientDisconnected:
+                context = getattr(self, '_failure_context', None)
+                if context is not None:
+                    context.observe_downstream()
+                self.close_connection = True
             except OSError:
                 self.close_connection = True
 
@@ -2140,6 +2299,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if len(raw) > MAX_BODY:
                 return self.error(413, 'Decoded body exceeds the adapter limit')
             source = json.loads(raw)
+            failure_context.set_request_shape(source, self.headers)
             route = None
             if routed:
                 translation, headers, base, route, revision = prepared_routed_request(source, self.headers)
@@ -2175,12 +2335,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     LAST_ROUTE = dict(route, state='waiting', retry_after_seconds=math.ceil(seconds))
                 if translation.request.get('stream') and time.monotonic() - last_heartbeat >= 10:
                     if not started:
-                        self.begin_event_stream(route)
+                        self.begin_event_stream(route, azure_budget)
                         started = True
                         streaming_response = True
                         headers_complete = True
-                    self.wfile.write(b': Model Harbor is waiting for provider capacity\n\n')
-                    self.wfile.flush()
+                    self.write_output(b': Model Harbor is waiting for provider capacity\n\n', azure_budget)
                     last_heartbeat = time.monotonic()
             if route and route['provider'] == 'baseten':
                 pacer = baseten_pacer(route['model'])
@@ -2347,6 +2506,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     azure_recovery_recorded = True
                 if stream_error is not None:
                     raise stream_error
+                failure_context.observe_upstream('eof', 'stream_read')
                 report_error(502, 'The upstream stream ended before a terminal response event. Model Harbor did not retry the model request.')
                 translation.response_status = 'failed'
                 if route:
@@ -2453,7 +2613,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if azure_stopped():
                 return
             report_error(400, str(error))
-        except socket.timeout:
+        except _ClientDisconnected:
+            failure_context.observe_downstream()
+            failure_kind = 'client_disconnected'
+            activity_status = 'cancelled'
+            if route:
+                with ROUTE_LOCK:
+                    LAST_ROUTE = dict(route, state='failed')
+            self.close_connection = True
+        except socket.timeout as error:
+            failure_context.observe_upstream('timeout', _transport_operation(azure_initial_attempts, azure_resume_attempts, started))
             failure_kind = 'upstream_timeout'
             if azure_stopped():
                 return
@@ -2463,20 +2632,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             activity_http_status = 504
             report_error(504, 'The upstream response timed out. Model Harbor did not retry the partial response.')
             self.close_connection = True
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as error:
+            failure_context.observe_upstream(TRANSPORT.classify(error), _transport_operation(azure_initial_attempts, azure_resume_attempts, started))
             failure_kind = 'connection_interrupted'
             if azure_stopped():
                 return
             if route:
                 with ROUTE_LOCK:
                     LAST_ROUTE = dict(route, state='disconnected')
-            report_error(502, 'The response connection was interrupted.')
+            provider = 'Azure' if route and route['provider'] == 'azure' else (route['provider'] if route else 'provider')
+            report_error(502, 'The response connection was interrupted because the upstream ' + provider + ' connection was interrupted. Model Harbor did not retry the request.')
             self.close_connection = True
         except (ssl.SSLError, socket.gaierror, ConnectionRefusedError, urllib.error.URLError) as error:
             if isinstance(error, urllib.error.HTTPError):
                 report_error(error.code, str(error))
                 self.close_connection = True
                 return
+            failure_context.observe_upstream(TRANSPORT.classify(error), _transport_operation(azure_initial_attempts, azure_resume_attempts, started))
+            failure_kind = TRANSPORT.classify(error)
+            if azure_stopped():
+                return
+            if route:
+                with ROUTE_LOCK:
+                    LAST_ROUTE = dict(route, state='failed')
+            report_error(502, 'The upstream connection failed: ' + failure_kind + '. Model Harbor did not retry the request.')
+            self.close_connection = True
+        except OSError as error:
+            failure_context.observe_upstream(TRANSPORT.classify(error), _transport_operation(azure_initial_attempts, azure_resume_attempts, started))
             failure_kind = TRANSPORT.classify(error)
             if azure_stopped():
                 return
@@ -2504,18 +2686,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 azure_budget.finish()
             if azure_permit is not None:
                 azure_permit.release()
+            if failure_context.terminal_delivered:
+                azure_outcome_known = True
+                activity_status = 'completed'
+                failure_kind = None
             if request_lease is not None:
                 # A completed response can still request tools. Keep the turn owner.
                 known = (azure_outcome_known or not azure_budget.dispatch_possible) if azure_budget is not None else (activity_status == 'completed' or activity_http_status is not None and not started)
                 RUNTIME.finish(request_lease, known or maintenance_not_dispatched)
             if activity_started and activity_status != 'completed':
-                failure = {'provider': route['provider'], 'model': route['model'],
-                    'kind': failure_kind or (azure_budget.stop_reason if azure_budget else None) or 'incomplete',
-                    'elapsed_seconds': round(time.monotonic() - request_started_at, 3),
-                    'at': time.time()}
-                if route['provider'] == 'azure' and azure_budget is not None:
-                    failure.update(phase=azure_initial_retry_phase(azure_budget, translation),
-                                   initial_post_attempts=azure_initial_attempts)
+                phase = (azure_initial_retry_phase(azure_budget, translation)
+                         if route['provider'] == 'azure' and azure_budget is not None else None)
+                failure = failure_context.record(
+                    provider=route['provider'], model=route['model'], budget=azure_budget,
+                    elapsed=time.monotonic() - request_started_at,
+                    attempts=azure_initial_attempts, resume_attempts=azure_resume_attempts,
+                    phase=phase,
+                    kind=('client_disconnected' if failure_context.classification == 'client_disconnected'
+                          else failure_kind or (azure_budget.stop_reason if azure_budget else None)))
+                if failure is None:
+                    failure = {'provider': route['provider'], 'model': route['model'],
+                        'kind': failure_kind or (azure_budget.stop_reason if azure_budget else None) or 'incomplete',
+                        'elapsed_seconds': round(time.monotonic() - request_started_at, 3),
+                        'at': time.time()}
+                    if phase is not None:
+                        failure.update(phase=phase, initial_post_attempts=azure_initial_attempts)
                 with ROUTE_LOCK:
                     RECENT_FAILURES.append(failure)
             if activity_started:
@@ -2531,14 +2726,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         model=route['model'])
                 USAGE_LEDGER.record({'provider': route['provider'], 'model': route['model'],
                     'status': activity_status, 'http_status': activity_http_status,
-                    'failure_class': failure_kind or (azure_budget.stop_reason if azure_budget else None),
+                    'failure_class': failure_context.classification or failure_kind or (azure_budget.stop_reason if azure_budget else None),
                     'stream': bool(translation.request.get('stream')) if hasattr(translation, 'request') else None,
                     'duration_seconds': time.monotonic() - request_started_at,
                     'usage': usage, 'estimated': estimated})
             if metrics_handle is not None:
                 metric_state = ('completed' if activity_status == 'completed' else
                                 'cancelled' if activity_status == 'cancelled' else
-                                'disconnected' if failure_kind == 'connection_interrupted' else
+                                'disconnected' if failure_context.classification == 'client_disconnected' else
                                 'failed' if activity_http_status is not None or failure_kind else 'incomplete')
                 REQUEST_METRICS.finish(metrics_handle, metric_state, translation.usage)
             if acquired:

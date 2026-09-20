@@ -325,6 +325,67 @@ class AzureHandlerDeadlineTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_PROMPT_MARKER', encoded)
         self.assertNotIn(self.key, encoded)
 
+    def test_compaction_shaped_post_dispatch_failure_is_content_free_and_not_replayed(self):
+        original_budget = bridge._transport_module.RequestBudget
+        budgets = []
+
+        def tracked_budget(*args, **kwargs):
+            budget = original_budget(*args, **kwargs)
+            budgets.append(budget)
+            return budget
+
+        calls = []
+
+        def upstream(request, **_kwargs):
+            calls.append(request)
+            budgets[-1].mark_model_bytes_possible()
+            raise ConnectionResetError('PRIVATE_COMPACTION_MARKER and provider secret')
+
+        source = {
+            'model': 'harbor/azure/coding-prod',
+            'input': [{'type': 'compaction', 'encrypted_content': 'PRIVATE_COMPACTION_MARKER'}],
+            'stream': False,
+        }
+        turn_metadata = json.dumps({
+            'thread_id': 'fixture-task',
+            'turn_id': 'compaction-turn',
+            'request_kind': 'compaction',
+            'compaction': {'phase': 'pre_turn'},
+        })
+
+        def request():
+            connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=4)
+            try:
+                connection.request('POST', '/harbor/v1/responses', json.dumps(source),
+                                   {'Authorization': 'Bearer synthetic-owner-token',
+                                    'x-codex-turn-metadata': turn_metadata})
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        with patch.object(bridge._transport_module, 'RequestBudget', side_effect=tracked_budget), \
+             patch.object(bridge.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = upstream
+            status, body = request()
+
+        self.assertEqual(status, 502)
+        self.assertIn(b'upstream Azure connection was interrupted', body)
+        self.assertEqual(len(calls), 1)
+        self.finished()
+        self.assertEqual(self.runtime.status()['uncertain_turns'], 1)
+        self.assertEqual(request()[0], 400)
+        self.assertEqual(len(calls), 1)
+        failure = bridge.RECENT_FAILURES[-1]
+        self.assertEqual(failure['side'], 'upstream')
+        self.assertEqual(failure['classification'], 'provider_connection_lost')
+        self.assertEqual(failure['request_kind'], 'compaction')
+        self.assertEqual(failure['compaction_phase'], 'pre_turn')
+        encoded = json.dumps(failure)
+        self.assertNotIn('PRIVATE_COMPACTION_MARKER', encoded)
+        self.assertNotIn('provider secret', encoded)
+        self.assertNotIn(self.key, encoded)
+
     def test_background_azure_stream_resumes_after_eof_without_replaying_post(self):
         self.mode = 'stream-resumable'
         self.write_effort('none', resumable=True)
@@ -567,6 +628,30 @@ class AzureHandlerDeadlineTests(unittest.TestCase):
                 client.close()
         self.assertEqual(self.runtime.status()['uncertain_turns'], 1)
         self.assertEqual(self.attempts, 1)
+        failure = bridge.RECENT_FAILURES[-1]
+        self.assertEqual(failure['side'], 'downstream')
+        self.assertEqual(failure['classification'], 'client_disconnected')
+        self.assertEqual(failure['kind'], 'client_disconnected')
+
+    def test_upstream_reset_is_reported_as_provider_failure_not_client_disconnect(self):
+        original_budget = bridge._transport_module.RequestBudget
+
+        def dispatched_budget(*args, **kwargs):
+            budget = original_budget(*args, **kwargs)
+            budget.mark_model_bytes_possible()
+            return budget
+
+        with patch.object(bridge._transport_module, 'RequestBudget', side_effect=dispatched_budget), \
+             patch.object(bridge.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.side_effect = ConnectionResetError('private upstream detail')
+            status, body = self.inference('provider-reset')
+        self.assertEqual(status, 502)
+        self.assertIn(b'upstream Azure connection', body)
+        self.finished()
+        failure = bridge.RECENT_FAILURES[-1]
+        self.assertEqual(failure['side'], 'upstream')
+        self.assertEqual(failure['classification'], 'provider_connection_lost')
+        self.assertNotIn('private upstream detail', json.dumps(failure))
 
     def test_verification_rejects_completed_json_with_truncated_http_framing(self):
         self.mode = 'verify-truncated'
