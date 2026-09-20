@@ -11,10 +11,14 @@ final class ConnectionPresentationTests: XCTestCase {
         ]], provider: "azure", revision: "current", bootID: "current")
     }
 
-    func testExpiredSuccessfulCheckRemainsConnected() {
-        XCTAssertTrue(connection().connected)
-        XCTAssertEqual(connection().label, "Connected")
+    func testFreshSuccessfulCheckIsConnected() {
         XCTAssertTrue(connection(fresh: true).connected)
+        XCTAssertEqual(connection(fresh: true).label, "Connected")
+    }
+
+    func testExpiredSuccessfulCheckIsNotPresentedAsConnected() {
+        XCTAssertFalse(connection(fresh: false).connected)
+        XCTAssertEqual(connection(fresh: false).label, "Configured")
     }
 
     func testCredentialsAndCurrentAccountEvidenceAreRequired() {

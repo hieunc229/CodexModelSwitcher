@@ -111,6 +111,7 @@ class FailureContext:
         self.upstream = None
         self.downstream = None
         self.terminal_delivered = False
+        self.failure_delivered = False
         self.request_kind = 'normal_or_unknown'
         self.compaction_phase = None
 
@@ -150,6 +151,9 @@ class FailureContext:
     def mark_terminal_delivered(self):
         self.terminal_delivered = True
 
+    def mark_failure_delivered(self):
+        self.failure_delivered = True
+
     @property
     def classification(self):
         if self.upstream and self.downstream:
@@ -187,7 +191,7 @@ class FailureContext:
             'dispatch_state': budget.dispatch_state.name.lower() if budget else 'not_started',
             'initial_post_attempts': attempts,
             'resume_attempts': resume_attempts,
-            'outcome': 'known' if self.terminal_delivered else 'uncertain',
+            'outcome': 'known' if self.terminal_delivered or self.failure_delivered else 'uncertain',
             'elapsed_seconds': round(elapsed, 3),
             'at': time.time(),
         }
@@ -1695,6 +1699,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
         self.finish_headers(budget)
         self.write_output(body, budget)
+        context = getattr(self, '_failure_context', None)
+        if context is not None:
+            context.mark_failure_delivered()
 
     def begin_event_stream(self, route, budget=None):
         self.send_response(200)
@@ -1714,6 +1721,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  'error': {'code': code, 'message': message}}}
         try:
             self.write_output(('event: response.failed\ndata: ' + json.dumps(event) + '\n\n').encode(), budget)
+            context = getattr(self, '_failure_context', None)
+            if context is not None:
+                context.mark_failure_delivered()
         except _ClientDisconnected:
             context = getattr(self, '_failure_context', None)
             if context is not None:
@@ -2528,6 +2538,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 azure_budget.check()
         except urllib.error.HTTPError as error:
             try:
+                failure_context.observe_upstream(
+                    'http_' + str(error.code),
+                    _transport_operation(azure_initial_attempts, azure_resume_attempts, started))
+                failure_kind = 'provider_http_error'
                 activity_http_status = error.code
                 if route and revision and route['provider'] in ('azure', 'openrouter'):
                     record_readiness(route, revision, 'auth_failed' if error.code in (401, 403) else 'unavailable')

@@ -13,7 +13,8 @@ struct APIConnectionPresentation {
             && $0["boot_id"] as? String == bootID }
     }
     var connected: Bool {
-        credentialsAvailable && current.contains { $0["result"] as? String == "verified" }
+        credentialsAvailable && current.contains { $0["result"] as? String == "verified"
+            && $0["verified"] as? Bool == true }
             && !current.contains { $0["result"] as? String == "auth_failed" }
     }
     var label: String {

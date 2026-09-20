@@ -386,6 +386,45 @@ class AzureHandlerDeadlineTests(unittest.TestCase):
         self.assertNotIn('provider secret', encoded)
         self.assertNotIn(self.key, encoded)
 
+    def test_compaction_shaped_provider_http_error_is_classified_and_known(self):
+        self.mode = 'retryable'
+        source = {
+            'model': 'harbor/azure/coding-prod',
+            'input': [{'type': 'compaction', 'encrypted_content': 'PRIVATE_COMPACTION_MARKER'}],
+            'stream': False,
+        }
+        turn_metadata = json.dumps({
+            'thread_id': 'fixture-task',
+            'turn_id': 'compaction-http-error',
+            'request_kind': 'compaction',
+            'compaction': {'phase': 'pre_turn'},
+        })
+
+        def request():
+            connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=4)
+            try:
+                connection.request('POST', '/harbor/v1/responses', json.dumps(source),
+                                   {'Authorization': 'Bearer synthetic-owner-token',
+                                    'x-codex-turn-metadata': turn_metadata})
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        status, _body = request()
+        self.assertEqual(status, 429)
+        self.finished()
+        self.assertEqual(self.runtime.status()['uncertain_turns'], 0)
+        failure = bridge.RECENT_FAILURES[-1]
+        self.assertEqual(failure['side'], 'upstream')
+        self.assertEqual(failure['classification'], 'provider_http_error')
+        self.assertEqual(failure['kind'], 'provider_http_error')
+        self.assertEqual(failure['request_kind'], 'compaction')
+        self.assertEqual(failure['compaction_phase'], 'pre_turn')
+        encoded = json.dumps(failure)
+        self.assertNotIn('PRIVATE_COMPACTION_MARKER', encoded)
+        self.assertNotIn(self.key, encoded)
+
     def test_background_azure_stream_resumes_after_eof_without_replaying_post(self):
         self.mode = 'stream-resumable'
         self.write_effort('none', resumable=True)
@@ -717,6 +756,9 @@ class AzureHandlerDeadlineTests(unittest.TestCase):
             self.finished()
             self.assertEqual(self.runtime.status()['uncertain_turns'], 0)
             self.assertEqual(self.attempts, 1)
+            failure = bridge.RECENT_FAILURES[-1]
+            self.assertEqual(failure['classification'], 'provider_http_error')
+            self.assertEqual(failure['outcome'], 'known')
         finally:
             connection.close()
             if held_socket is not None:
